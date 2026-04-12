@@ -7,7 +7,7 @@
 ### 1. Build and Run
 
 ```bash
-docker compose up -d --build && docker compose exec backtest bash
+docker compose up -d --build; docker compose exec backtest bash
 ```
 
 This will:
