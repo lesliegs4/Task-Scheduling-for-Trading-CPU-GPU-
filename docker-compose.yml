@@ -1,0 +1,6 @@
+services:
+  backtest:
+    build: .
+    volumes:
+      - .:/home/nautilus
+    command: tail -f /dev/null
