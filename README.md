@@ -18,7 +18,7 @@ This will:
 ### 2. Run Without Rebuilding
 
 ```bash
-docker compose up -d && docker compose exec backtest bash
+docker compose up -d; docker compose exec backtest bash
 ```
 
 ### 3. Run the Backtest
@@ -28,8 +28,6 @@ Inside the container shell:
 ```bash
 python backtest_fx_bars.py
 ```
-
-Results are saved to `output/` in your local project folder.
 
 ### 4. Stop the Container
 
