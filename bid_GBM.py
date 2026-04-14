@@ -35,7 +35,7 @@ dt = 1 # 1 time step, data is one min apart
 S0 = prices.iloc[-1] # last known price
 n_timeintervals = 200 
 N_sim = 10000
-np.random.seed(42) # for reproducibility
+# np.random.seed(42) # uncomment to reproduce same paths
 
 Z = np.random.standard_normal((n_timeintervals, N_sim))
 step = np.exp((drift - 0.5 * volatility**2) * dt + volatility * np.sqrt(dt) * Z)
@@ -44,6 +44,8 @@ sim = np.zeros((n_timeintervals + 1, N_sim))
 sim[0] = S0
 for t in range(1, n_timeintervals + 1):
     sim[t] = sim[t - 1] * step[t - 1]
+
+print(sim.shape) # (201, 10000)
 
 fig, axes = plt.subplots(2, 1, figsize=(12, 8), squeeze=False)
 
@@ -67,7 +69,6 @@ plt.tight_layout()
 plt.savefig("gbm_bid_sim.png", dpi=150)
 plt.show()
 
-# ── 5. Summary stats at final step ──────────────────────────────────────────
 final = sim[-1]
 print(f"\nFinal-step statistics across {N_sim} paths:")
 print(f"  Mean:   {final.mean():.4f}")

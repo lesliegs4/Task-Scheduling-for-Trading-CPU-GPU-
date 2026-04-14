@@ -140,6 +140,7 @@ engine.add_strategy(strategy=strategy)
 
 # %%
 engine.run()
+#print(engine.get_result())
 
 # %% [markdown]
 # ## Reports
