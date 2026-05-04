@@ -36,6 +36,8 @@ from nautilus_trader.persistence.wranglers import QuoteTickDataWrangler
 from nautilus_trader.test_kit.providers import TestDataProvider
 from nautilus_trader.test_kit.providers import TestInstrumentProvider
 
+import time
+
 # %% [markdown]
 # ## Set up the engine
 
@@ -139,7 +141,12 @@ engine.add_strategy(strategy=strategy)
 # report when complete.
 
 # %%
+start = time.perf_counter()
 engine.run()
+end = time.perf_counter()
+
+elapsed = end - start
+print(f"CPU NautilusTrader backtest time: {elapsed:.6f} seconds")
 #print(engine.get_result())
 
 # %% [markdown]
