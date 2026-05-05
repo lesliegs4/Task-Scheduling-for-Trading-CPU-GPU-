@@ -1,0 +1,18 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.venv/
+
+# VSCode
+.vscode/
+
+# Ignore generated reports
+reports/heston/*
+reports/jump_diffusion/*
+
+# Keep folder structure
+!reports/.gitkeep
+!reports/heston/.gitkeep
+!reports/jump_diffusion/.gitkeep
