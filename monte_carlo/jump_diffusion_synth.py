@@ -24,7 +24,7 @@ import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
 
-from monte_carlo.trading_model_utils import (
+from trading_model_utils import (
     BarModelParams,
     close_prices_to_log_returns,
     infer_step_seconds,
@@ -208,11 +208,21 @@ def main() -> None:
 
     t0 = perf_counter()
 
+    # Load CSV
+    t_load_start = perf_counter()
     df = load_bars(args.input)
+    t_load_end = perf_counter()
+    
+    # Fit parameters
+    t_fit_start = perf_counter()
     params = fit_jump_diffusion_params(df, jump_threshold_mult=args.jump_threshold_mult)
+    t_fit_end = perf_counter()
+    
     dt_seconds = infer_step_seconds(df["timestamp"])
     dt = 1.0  # one step per bar interval for the synthetic process
 
+    # Heavy work: simulate many paths
+    t_jd_start = perf_counter()
     all_paths = simulate_jump_diffusion_paths(
         n_paths=args.n_paths,
         n_steps=len(df),
@@ -221,6 +231,7 @@ def main() -> None:
         seed=args.seed,
         chunk_size=args.chunk_size,
     )
+    t_jd_end = perf_counter()
 
     # Use the first simulated path as the synthetic OHLC series for your backtest.
     close_path = all_paths[0]
@@ -229,8 +240,14 @@ def main() -> None:
         close_path,
         rng=np.random.default_rng(args.seed),
     )
+    
+    # Save files
+    t_save_start = perf_counter()
     save_bars(synthetic, args.output_bars)
+    t_save_end = perf_counter()
 
+    # Generate plots
+    t_plot_start = perf_counter()
     plot_files: list[str] = []
     if not args.no_plots:
         plot_files = plot_jump_diffusion_results(
@@ -239,6 +256,7 @@ def main() -> None:
             all_paths=all_paths,
             output_prefix=args.plot_prefix,
         )
+    t_plot_end = perf_counter()
 
     t1 = perf_counter()
 
@@ -257,6 +275,13 @@ def main() -> None:
                 "n_paths": args.n_paths,
                 "chunk_size": args.chunk_size,
                 "elapsed_seconds": t1 - t0,
+                "timing_breakdown": {
+                    "load_csv_seconds": t_load_end - t_load_start,
+                    "fit_parameters_seconds": t_fit_end - t_fit_start,
+                    "jump_diffusion_simulation_seconds": t_jd_end - t_jd_start,
+                    "save_files_seconds": t_save_end - t_save_start,
+                    "generate_plots_seconds": t_plot_end - t_plot_start,
+                },
                 "params": asdict(params),
                 "path_stats": path_stats,
                 "plot_files": plot_files,
@@ -276,7 +301,13 @@ def main() -> None:
     if plot_files:
         for file in plot_files:
             print(f"Saved plot to {file}")
-    print(f"Simulated {args.n_paths} paths in {t1 - t0:.3f} seconds")
+    print("\n=== Timing Breakdown ===")
+    print(f"  Load CSV:               {t_load_end - t_load_start:.3f}s")
+    print(f"  Fit parameters:         {t_fit_end - t_fit_start:.3f}s")
+    print(f"  Jump-diffusion sim:     {t_jd_end - t_jd_start:.3f}s")
+    print(f"  Save files:             {t_save_end - t_save_start:.3f}s")
+    print(f"  Generate plots:         {t_plot_end - t_plot_start:.3f}s")
+    print(f"  Total elapsed:          {t1 - t0:.3f}s")
 
 
 if __name__ == "__main__":
