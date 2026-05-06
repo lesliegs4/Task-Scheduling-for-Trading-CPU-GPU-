@@ -5,7 +5,9 @@
 #include <cerrno>
 #include <cmath>
 #include <cstddef>
+#include <cstdint>
 #include <cstdlib>
+#include <chrono>
 #include <filesystem>
 #include <fstream>
 #include <iomanip>
@@ -45,6 +47,77 @@ static std::vector<std::string> split_csv_line(const std::string& line) {
         out.push_back(cell);
     }
     return out;
+}
+
+static bool parse_utc_timestamp_seconds(const std::string& ts, std::int64_t& out_epoch_seconds) {
+    // Accepts common formats:
+    // - "2013-02-01 00:00:00+00:00"
+    // - "2013-02-01T00:00:00+00:00"
+    // - "2013-02-01 00:00:00Z"
+    // Keeps only "YYYY-MM-DD HH:MM:SS" and treats it as UTC.
+    std::string s = ts;
+    if (s.empty()) return false;
+    for (char& c : s) {
+        if (c == 'T') c = ' ';
+    }
+    // Strip timezone suffix.
+    size_t plus = s.find('+');
+    if (plus != std::string::npos) s = s.substr(0, plus);
+    // Handle trailing 'Z'
+    if (!s.empty() && (s.back() == 'Z' || s.back() == 'z')) s.pop_back();
+    // Keep first 19 chars: YYYY-MM-DD HH:MM:SS
+    if (s.size() < 19) return false;
+    s = s.substr(0, 19);
+
+    auto to_int = [&](int start, int len) -> int {
+        return std::stoi(s.substr((size_t)start, (size_t)len));
+    };
+
+    try {
+        int year = to_int(0, 4);
+        int mon = to_int(5, 2);
+        int day = to_int(8, 2);
+        int hour = to_int(11, 2);
+        int min = to_int(14, 2);
+        int sec = to_int(17, 2);
+
+        std::tm tm{};
+        tm.tm_year = year - 1900;
+        tm.tm_mon = mon - 1;
+        tm.tm_mday = day;
+        tm.tm_hour = hour;
+        tm.tm_min = min;
+        tm.tm_sec = sec;
+        tm.tm_isdst = 0;
+
+        // timegm is available on Linux (CARC).
+        std::time_t t = timegm(&tm);
+        if (t == (std::time_t)-1) return false;
+        out_epoch_seconds = (std::int64_t)t;
+        return true;
+    } catch (...) {
+        return false;
+    }
+}
+
+static double median_step_seconds(const std::vector<std::string>& timestamps) {
+    if (timestamps.size() < 2) return 0.0;
+    std::vector<double> deltas;
+    deltas.reserve(timestamps.size() - 1);
+
+    std::int64_t prev = 0;
+    if (!parse_utc_timestamp_seconds(timestamps[0], prev)) return 0.0;
+    for (size_t i = 1; i < timestamps.size(); i++) {
+        std::int64_t cur = 0;
+        if (!parse_utc_timestamp_seconds(timestamps[i], cur)) continue;
+        deltas.push_back((double)(cur - prev));
+        prev = cur;
+    }
+    if (deltas.empty()) return 0.0;
+    std::sort(deltas.begin(), deltas.end());
+    size_t mid = deltas.size() / 2;
+    if (deltas.size() % 2 == 1) return deltas[mid];
+    return 0.5 * (deltas[mid - 1] + deltas[mid]);
 }
 
 // Load timestamps + close from CSV with header including at least timestamp and close.
@@ -190,6 +263,8 @@ static JumpDiffusionParams fit_jump_diffusion_params(
 __global__ void jump_diffusion_kernel_final_and_first_path(
     double* final_prices_out,   // N paths
     double* first_path_out,     // n_steps (only written by idx==0)
+    double* sample_paths_out,   // sample_paths_count * n_steps (only written by idx < sample_paths_count)
+    int sample_paths_count,
     JumpDiffusionParams params,
     int n_steps,
     int n_paths,
@@ -205,6 +280,9 @@ __global__ void jump_diffusion_kernel_final_and_first_path(
     double S = params.s0;
     if (idx == 0 && first_path_out != nullptr && n_steps > 0) {
         first_path_out[0] = S;
+    }
+    if (sample_paths_out != nullptr && idx < sample_paths_count && n_steps > 0) {
+        sample_paths_out[(size_t)idx * (size_t)n_steps + 0] = S;
     }
 
     double sqrt_dt = sqrt(dt);
@@ -231,6 +309,9 @@ __global__ void jump_diffusion_kernel_final_and_first_path(
 
         if (idx == 0 && first_path_out != nullptr) {
             first_path_out[t] = S;
+        }
+        if (sample_paths_out != nullptr && idx < sample_paths_count) {
+            sample_paths_out[(size_t)idx * (size_t)n_steps + (size_t)t] = S;
         }
     }
 
@@ -267,6 +348,7 @@ static Percentiles compute_percentiles_5_50_95(const std::vector<double>& values
 static void write_params_json(
     const std::string& out_path,
     const std::string& fit_from,
+    double step_seconds,
     int n_paths,
     int n_steps,
     double elapsed_seconds,
@@ -274,7 +356,19 @@ static void write_params_json(
     double mean_final,
     double std_final,
     double min_final,
-    double max_final
+    double max_final,
+    const std::vector<std::string>& plot_files,
+    const std::string& sample_paths_csv,
+    const std::string& final_prices_csv,
+    double load_csv_seconds,
+    double fit_parameters_seconds,
+    double jump_diffusion_simulation_seconds,
+    double gpu_alloc_seconds,
+    double gpu_kernel_seconds,
+    double gpu_d2h_seconds,
+    double host_postprocess_seconds,
+    double save_files_seconds,
+    double generate_plots_seconds
 ) {
     std::ofstream out(out_path);
     if (!out.is_open()) throw std::runtime_error("Could not write: " + out_path);
@@ -282,9 +376,17 @@ static void write_params_json(
     out << std::setprecision(12);
     out << "{\n";
     out << "  \"fit_from\": " << "\"" << fit_from << "\",\n";
+    out << "  \"step_seconds\": " << step_seconds << ",\n";
     out << "  \"n_paths\": " << n_paths << ",\n";
     out << "  \"n_steps\": " << n_steps << ",\n";
     out << "  \"elapsed_seconds\": " << elapsed_seconds << ",\n";
+    out << "  \"timing_breakdown\": {\n";
+    out << "    \"fit_parameters_seconds\": " << fit_parameters_seconds << ",\n";
+    out << "    \"generate_plots_seconds\": " << generate_plots_seconds << ",\n";
+    out << "    \"jump_diffusion_simulation_seconds\": " << jump_diffusion_simulation_seconds << ",\n";
+    out << "    \"load_sv_seconds\": " << load_csv_seconds << ",\n";
+    out << "    \"save_files_seconds\": " << save_files_seconds << "\n";
+    out << "  },\n";
     out << "  \"params\": {\n";
     out << "    \"model\": \"jump_diffusion\",\n";
     out << "    \"s0\": " << p.s0 << ",\n";
@@ -303,6 +405,26 @@ static void write_params_json(
     out << "    \"min_final_price\": " << min_final << ",\n";
     out << "    \"max_final_price\": " << max_final << "\n";
     out << "  }\n";
+    if (!sample_paths_csv.empty() || !final_prices_csv.empty()) {
+        out << "  ,\"artifacts\": {\n";
+        bool first = true;
+        if (!sample_paths_csv.empty()) {
+            out << "    \"sample_paths_csv\": " << "\"" << sample_paths_csv << "\"";
+            first = false;
+        }
+        if (!final_prices_csv.empty()) {
+            if (!first) out << ",\n";
+            out << "    \"final_prices_csv\": " << "\"" << final_prices_csv << "\"";
+        }
+        out << "\n  }\n";
+    }
+    out << "  ,\"plot_files\": [";
+    for (size_t i = 0; i < plot_files.size(); i++) {
+        if (i) out << ",";
+        out << "\n    " << "\"" << plot_files[i] << "\"";
+    }
+    if (!plot_files.empty()) out << "\n  ";
+    out << "]\n";
     out << "}\n";
 }
 
@@ -349,6 +471,48 @@ static void write_synthetic_bars_csv(
     }
 }
 
+static void write_final_prices_csv(const std::string& out_path, const std::vector<double>& final_prices) {
+    std::ofstream out(out_path);
+    if (!out.is_open()) throw std::runtime_error("Could not write: " + out_path);
+    out << "final_price\n";
+    out << std::setprecision(12);
+    for (double v : final_prices) {
+        out << v << "\n";
+    }
+}
+
+static void write_sample_paths_csv(
+    const std::string& out_path,
+    const std::vector<std::string>& timestamps,
+    const std::vector<double>& sample_paths,  // sample_paths_count * n_steps
+    int sample_paths_count,
+    int n_steps
+) {
+    if ((int)timestamps.size() != n_steps) {
+        throw std::runtime_error("timestamps length must equal n_steps for sample paths output.");
+    }
+    if ((int)sample_paths.size() != sample_paths_count * n_steps) {
+        throw std::runtime_error("sample_paths size mismatch.");
+    }
+    std::ofstream out(out_path);
+    if (!out.is_open()) throw std::runtime_error("Could not write: " + out_path);
+
+    out << "timestamp";
+    for (int p = 0; p < sample_paths_count; p++) {
+        out << ",path_" << p;
+    }
+    out << "\n";
+    out << std::setprecision(12);
+
+    for (int t = 0; t < n_steps; t++) {
+        out << timestamps[(size_t)t];
+        for (int p = 0; p < sample_paths_count; p++) {
+            out << "," << sample_paths[(size_t)p * (size_t)n_steps + (size_t)t];
+        }
+        out << "\n";
+    }
+}
+
 static int parse_int_arg(const std::string& v, const std::string& name) {
     char* endptr = nullptr;
     errno = 0;
@@ -374,6 +538,9 @@ int main(int argc, char** argv) {
     std::string input_csv;
     std::string output_bars = "reports/jump_diffusion/jump_diffusion_synthetic_bars_cuda.csv";
     std::string output_params = "reports/jump_diffusion/jump_diffusion_params_cuda.json";
+    std::string output_final_prices = "";
+    std::string output_sample_paths = "";
+    int sample_paths = 0;
     int n_paths = 10000;
     int n_steps = 200;
     int seed = 42;
@@ -390,6 +557,9 @@ int main(int argc, char** argv) {
         if (a == "--input") input_csv = need_value(a);
         else if (a == "--output-bars") output_bars = need_value(a);
         else if (a == "--output-params") output_params = need_value(a);
+        else if (a == "--output-final-prices") output_final_prices = need_value(a);
+        else if (a == "--output-sample-paths") output_sample_paths = need_value(a);
+        else if (a == "--sample-paths") sample_paths = parse_int_arg(need_value(a), a);
         else if (a == "--n-paths") n_paths = parse_int_arg(need_value(a), a);
         else if (a == "--n-steps") n_steps = parse_int_arg(need_value(a), a);
         else if (a == "--seed") seed = parse_int_arg(need_value(a), a);
@@ -407,7 +577,10 @@ int main(int argc, char** argv) {
                 << "  --jump-threshold-mult <f>  Jump threshold multiplier (default 2.5)\n"
                 << "  --dt <f>                   Time step (default 1.0)\n"
                 << "  --output-bars <csv>        Output synthetic OHLC CSV (default reports/...)\n"
-                << "  --output-params <json>     Output params + stats JSON (default reports/...)\n\n"
+                << "  --output-params <json>     Output params + stats JSON (default reports/...)\n"
+                << "  --sample-paths <int>       Also record the first K full paths (for plotting)\n"
+                << "  --output-sample-paths <csv>  CSV of sample paths (requires --sample-paths)\n"
+                << "  --output-final-prices <csv>  CSV of all final prices (optional; can be large)\n\n"
                 << "Build example:\n"
                 << "  nvcc -O3 -std=c++17 monte_carlo/GPU/jump_diffusion_synth.cu -o jump_diffusion_cuda -lcurand\n"
                 << "Run example:\n"
@@ -424,29 +597,59 @@ int main(int argc, char** argv) {
     if (n_paths <= 0) throw std::runtime_error("--n-paths must be > 0");
     if (n_steps <= 1) throw std::runtime_error("--n-steps must be >= 2");
     if (dt <= 0.0) throw std::runtime_error("--dt must be > 0");
+    if (sample_paths < 0) throw std::runtime_error("--sample-paths must be >= 0");
+    if (sample_paths > n_paths) sample_paths = n_paths;
+    if (sample_paths > 0 && output_sample_paths.empty()) {
+        output_sample_paths = "reports/jump_diffusion/jump_diffusion_sample_paths_cuda.csv";
+    }
+    if (!output_final_prices.empty() && output_final_prices == "1") {
+        // Convenience: --output-final-prices 1 uses a default path.
+        output_final_prices = "reports/jump_diffusion/jump_diffusion_final_prices_cuda.csv";
+    }
+
+    auto t_total_start = std::chrono::steady_clock::now();
 
     // Load only the first n_steps rows (so you can benchmark fixed steps like the GBM benchmark does).
+    auto t_load_start = std::chrono::steady_clock::now();
     auto [timestamps, close_prices] = read_timestamps_and_close(input_csv, n_steps);
     if ((int)close_prices.size() < n_steps) {
         throw std::runtime_error("Input CSV had fewer usable rows than --n-steps.");
     }
+    double step_seconds = median_step_seconds(timestamps);
+    auto t_load_end = std::chrono::steady_clock::now();
 
     // Fit params on CPU to match Python behavior.
+    auto t_fit_start = std::chrono::steady_clock::now();
     JumpDiffusionParams params = fit_jump_diffusion_params(close_prices, jump_threshold_mult);
+    auto t_fit_end = std::chrono::steady_clock::now();
 
     // Best-effort: create output directories if they don't exist.
     try {
         std::filesystem::create_directories(std::filesystem::path(output_bars).parent_path());
         std::filesystem::create_directories(std::filesystem::path(output_params).parent_path());
+        if (!output_sample_paths.empty()) {
+            std::filesystem::create_directories(std::filesystem::path(output_sample_paths).parent_path());
+        }
+        if (!output_final_prices.empty()) {
+            std::filesystem::create_directories(std::filesystem::path(output_final_prices).parent_path());
+        }
     } catch (...) {
         // Ignore; writing will fail later if paths are invalid.
     }
 
+    auto t_gpu_sim_start = std::chrono::steady_clock::now();
+
     // Allocate device buffers: final prices for all paths + first path series.
+    auto t_gpu_alloc_start = std::chrono::steady_clock::now();
     double* d_final = nullptr;
     double* d_first_path = nullptr;
+    double* d_sample_paths = nullptr;
     CHECK_CUDA(cudaMalloc(&d_final, (size_t)n_paths * sizeof(double)));
     CHECK_CUDA(cudaMalloc(&d_first_path, (size_t)n_steps * sizeof(double)));
+    if (sample_paths > 0) {
+        CHECK_CUDA(cudaMalloc(&d_sample_paths, (size_t)sample_paths * (size_t)n_steps * sizeof(double)));
+    }
+    auto t_gpu_alloc_end = std::chrono::steady_clock::now();
 
     int threads = 256;
     int blocks = (n_paths + threads - 1) / threads;
@@ -459,6 +662,8 @@ int main(int argc, char** argv) {
     jump_diffusion_kernel_final_and_first_path<<<blocks, threads>>>(
         d_final,
         d_first_path,
+        d_sample_paths,
+        sample_paths,
         params,
         n_steps,
         n_paths,
@@ -473,12 +678,27 @@ int main(int argc, char** argv) {
     CHECK_CUDA(cudaEventElapsedTime(&elapsed_ms, start, stop));
 
     // Copy results back.
+    auto t_d2h_start = std::chrono::steady_clock::now();
     std::vector<double> final_prices((size_t)n_paths);
     std::vector<double> first_path((size_t)n_steps);
+    std::vector<double> sample_paths_host;
+    if (sample_paths > 0) {
+        sample_paths_host.resize((size_t)sample_paths * (size_t)n_steps);
+    }
     CHECK_CUDA(cudaMemcpy(final_prices.data(), d_final, (size_t)n_paths * sizeof(double), cudaMemcpyDeviceToHost));
     CHECK_CUDA(cudaMemcpy(first_path.data(), d_first_path, (size_t)n_steps * sizeof(double), cudaMemcpyDeviceToHost));
+    if (sample_paths > 0) {
+        CHECK_CUDA(cudaMemcpy(
+            sample_paths_host.data(),
+            d_sample_paths,
+            (size_t)sample_paths * (size_t)n_steps * sizeof(double),
+            cudaMemcpyDeviceToHost
+        ));
+    }
+    auto t_d2h_end = std::chrono::steady_clock::now();
 
     // Compute simple path stats on CPU.
+    auto t_post_start = std::chrono::steady_clock::now();
     double sum = 0.0;
     double minv = final_prices[0];
     double maxv = final_prices[0];
@@ -498,39 +718,95 @@ int main(int argc, char** argv) {
     }
     double std_final = std::sqrt(var_acc);
 
-    // Write OHLC CSV from representative close path (first simulated path).
+    // Save output artifacts (kept separate from kernel timing).
+    auto t_save_start = std::chrono::steady_clock::now();
     write_synthetic_bars_csv(output_bars, timestamps, first_path, (unsigned int)seed);
+    if (!output_final_prices.empty()) {
+        write_final_prices_csv(output_final_prices, final_prices);
+    }
+    if (sample_paths > 0 && !output_sample_paths.empty()) {
+        write_sample_paths_csv(output_sample_paths, timestamps, sample_paths_host, sample_paths, n_steps);
+    }
+    auto t_save_end = std::chrono::steady_clock::now();
 
     // Write params/stats JSON. Use kernel time as the elapsed value (benchmark style).
+    Percentiles pct = compute_percentiles_5_50_95(final_prices);
+    auto t_post_end = std::chrono::steady_clock::now();
+
+    auto t_gpu_sim_end = std::chrono::steady_clock::now();
+
+    double elapsed_seconds_kernel = (double)elapsed_ms / 1000.0;
+    double elapsed_seconds_total = std::chrono::duration<double>(std::chrono::steady_clock::now() - t_total_start).count();
+
+    double load_csv_seconds = std::chrono::duration<double>(t_load_end - t_load_start).count();
+    double fit_parameters_seconds = std::chrono::duration<double>(t_fit_end - t_fit_start).count();
+    double jump_diffusion_sim_seconds = std::chrono::duration<double>(t_gpu_sim_end - t_gpu_sim_start).count();
+    double gpu_alloc_seconds = std::chrono::duration<double>(t_gpu_alloc_end - t_gpu_alloc_start).count();
+    double gpu_d2h_seconds = std::chrono::duration<double>(t_d2h_end - t_d2h_start).count();
+    double host_postprocess_seconds = std::chrono::duration<double>(t_post_end - t_post_start).count();
+    double save_files_seconds = std::chrono::duration<double>(t_save_end - t_save_start).count();
+
+    // Now that percentiles are computed, write JSON.
+    std::vector<std::string> plot_files;  // Generated by a post-step (see scripts).
+    double generate_plots_seconds = 0.0;
+
     write_params_json(
         output_params,
         input_csv,
+        step_seconds,
         n_paths,
         n_steps,
-        (double)elapsed_ms / 1000.0,
+        elapsed_seconds_total,
         params,
         mean_final,
         std_final,
         minv,
-        maxv
+        maxv,
+        plot_files,
+        output_sample_paths,
+        output_final_prices,
+        load_csv_seconds,
+        fit_parameters_seconds,
+        jump_diffusion_sim_seconds,
+        gpu_alloc_seconds,
+        elapsed_seconds_kernel,
+        gpu_d2h_seconds,
+        host_postprocess_seconds,
+        save_files_seconds,
+        generate_plots_seconds
     );
 
-    Percentiles pct = compute_percentiles_5_50_95(final_prices);
-
-    double elapsed_seconds = (double)elapsed_ms / 1000.0;
-
     std::cout << "CUDA kernel time: " << elapsed_ms << " ms\n";
-    std::cout << "Simulated " << n_paths << " paths in " << elapsed_seconds << " seconds\n";
+    std::cout << "Simulated " << n_paths << " paths in " << elapsed_seconds_kernel << " seconds\n";
+    std::cout << "Total wall time (host+GPU): " << elapsed_seconds_total << " seconds\n";
     std::cout << "Saved synthetic bars to " << output_bars << "\n";
     std::cout << "Saved params/stats to " << output_params << "\n";
+    if (!output_final_prices.empty()) {
+        std::cout << "Saved final prices to " << output_final_prices << "\n";
+    }
+    if (sample_paths > 0 && !output_sample_paths.empty()) {
+        std::cout << "Saved sample paths to " << output_sample_paths << "\n";
+    }
     std::cout << "Final price mean=" << mean_final
               << " median=" << pct.p50
               << " p5=" << pct.p5
               << " p95=" << pct.p95
               << "\n";
+    std::cout << "\n=== Timing Breakdown ===\n";
+    std::cout << "  Load CSV:                  " << load_csv_seconds << "s\n";
+    std::cout << "  Fit parameters:            " << fit_parameters_seconds << "s\n";
+    std::cout << "  Jump-diffusion (GPU total):" << jump_diffusion_sim_seconds << "s\n";
+    std::cout << "    GPU alloc:               " << gpu_alloc_seconds << "s\n";
+    std::cout << "    GPU kernel:              " << elapsed_seconds_kernel << "s\n";
+    std::cout << "    GPU D2H memcpy:          " << gpu_d2h_seconds << "s\n";
+    std::cout << "  Host postprocess:          " << host_postprocess_seconds << "s\n";
+    std::cout << "  Save files:                " << save_files_seconds << "s\n";
+    std::cout << "  Generate plots:            " << generate_plots_seconds << "s\n";
+    std::cout << "  Total wall:                " << elapsed_seconds_total << "s\n";
 
     CHECK_CUDA(cudaFree(d_final));
     CHECK_CUDA(cudaFree(d_first_path));
+    if (d_sample_paths != nullptr) CHECK_CUDA(cudaFree(d_sample_paths));
     CHECK_CUDA(cudaEventDestroy(start));
     CHECK_CUDA(cudaEventDestroy(stop));
 

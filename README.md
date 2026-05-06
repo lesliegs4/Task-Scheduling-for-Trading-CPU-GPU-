@@ -103,6 +103,28 @@ From the repo root on CARC:
 sbatch run_jumpdiff_gpu.slurm
 ```
 
+### Optional — Generate plots and populate `plot_files`
+
+The CUDA binary does not generate `.png` plots directly. If you run with extra outputs enabled (sample paths + final prices), you can generate the same plots as the CPU scripts and write them back into the JSON:
+
+1) Run CUDA with plot inputs enabled (small runs recommended):
+
+```bash
+./monte_carlo/GPU/build/jump_diffusion_cuda \
+  --input usdjpy-m1-bid-2013.csv \
+  --n-paths 10000 \
+  --n-steps 200 \
+  --sample-paths 20 \
+  --output-final-prices 1
+```
+
+2) Generate plots + update JSON:
+
+```bash
+python scripts/plot_jump_diffusion_cuda.py \
+  --json reports/jump_diffusion/jump_diffusion_params_cuda.json
+```
+
 ### Step 2 — Monitor
 
 ```bash
