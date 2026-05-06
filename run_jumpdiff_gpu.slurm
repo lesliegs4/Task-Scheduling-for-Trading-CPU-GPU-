@@ -19,7 +19,6 @@ module avail cuda
 # (On this cluster, `module avail cuda` lists e.g. cuda/11.3.0 as default.)
 module load cuda/11.3.0
 
-# Avoid swapping compilers after pinning gcc/8.5.0.
 module load gcc/8.5.0
 
 echo "Using nvcc at: $(which nvcc || true)"
@@ -27,10 +26,9 @@ nvcc --version
 
 cd ~/Task-Scheduling-for-Trading-CPU-GPU-
 
-# GCC 8.x needs -lstdc++fs for std::filesystem.
-nvcc -O3 -std=c++17 monte_carlo/GPU/jump_diffusion_synth.cu -o jump_diffusion_cuda -lcurand -lstdc++fs
+make -C monte_carlo/GPU clean all
 
 mkdir -p reports/jump_diffusion
 
-./jump_diffusion_cuda --input usdjpy-m1-bid-2013.csv --n-paths 1000 --n-steps 200
+./monte_carlo/GPU/build/jump_diffusion_cuda --input usdjpy-m1-bid-2013.csv --n-paths 1000 --n-steps 200
 
