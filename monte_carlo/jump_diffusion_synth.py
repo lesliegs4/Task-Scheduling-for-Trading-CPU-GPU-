@@ -24,7 +24,7 @@ import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
 
-from trading_model_utils import (
+from .trading_model_utils import (
     BarModelParams,
     close_prices_to_log_returns,
     infer_step_seconds,
