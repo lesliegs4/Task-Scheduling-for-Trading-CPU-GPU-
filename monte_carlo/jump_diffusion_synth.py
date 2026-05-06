@@ -276,11 +276,11 @@ def main() -> None:
                 "chunk_size": args.chunk_size,
                 "elapsed_seconds": t1 - t0,
                 "timing_breakdown": {
-                    "load_csv_seconds": t_load_end - t_load_start,
                     "fit_parameters_seconds": t_fit_end - t_fit_start,
                     "jump_diffusion_simulation_seconds": t_jd_end - t_jd_start,
-                    "save_files_seconds": t_save_end - t_save_start,
                     "generate_plots_seconds": t_plot_end - t_plot_start,
+                    "load_sv_seconds": t_load_end - t_load_start,
+                    "save_files_seconds": t_save_end - t_save_start,
                 },
                 "params": asdict(params),
                 "path_stats": path_stats,
