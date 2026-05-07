@@ -480,12 +480,22 @@ static bool flag_set(int argc, char** argv, const char* f) {
     return false;
 }
 
+static void write_final_prices_csv(const char* path, const std::vector<double>& finals) {
+    FILE* f = fopen(path, "w");
+    if (!f) { perror(path); exit(1); }
+    fprintf(f, "final_price\n");
+    for (double x : finals)
+        fprintf(f, "%.17g\n", x);
+    fclose(f);
+}
+
 static void print_usage(const char* prog) {
     fprintf(stderr,
         "Usage: %s --input FILE [options]\n\n"
         "  --input        FILE   input OHLC CSV (timestamp,open,high,low,close)\n"
         "  --out-bars     FILE   synthetic OHLC CSV          [heston_synthetic_bars.csv]\n"
         "  --out-params   FILE   fitted params + timing JSON  [heston_params.json]\n"
+        "  --output-final-prices FILE  per-path final prices CSV (header + one column)\n"
         "  --n-paths      N      Monte Carlo paths             [10000]\n"
         "  --block-size   N      CUDA threads/block            [256]\n"
         "  --seed         N      RNG seed                      [42]\n"
@@ -508,6 +518,7 @@ int main(int argc, char** argv) {
     const char* input_csv  = get_arg(argc, argv, "--input",      nullptr);
     const char* out_bars   = get_arg(argc, argv, "--out-bars",   "heston_synthetic_bars.csv");
     const char* out_params = get_arg(argc, argv, "--out-params", "heston_params.json");
+    const char* out_final_prices = get_arg(argc, argv, "--output-final-prices", nullptr);
     int         n_paths    = iarg(argc, argv, "--n-paths",   10000);
     int         block_size = iarg(argc, argv, "--block-size", 256);
     int         seed       = iarg(argc, argv, "--seed",       42);
@@ -597,6 +608,11 @@ int main(int argc, char** argv) {
         : 0.0;
     printf("[stats] final price  mean=%.6g  std=%.6g  min=%.6g  max=%.6g\n",
            mean_fp, std_fp, mn, mx);
+
+    if (out_final_prices) {
+        write_final_prices_csv(out_final_prices, h_finals);
+        printf("[out]   final prices   -> %s\n", out_final_prices);
+    }
 
     /* ---- 5. Synthetic OHLC ---- */
     clock_gettime(CLOCK_MONOTONIC, &t0);
