@@ -251,7 +251,7 @@ def _run_dynamic_hybrid(
                 break
             seed_b = int(base_seed_gpu) + gpu_batch_idx * 1_000_003
             prefix = f"gpu_dyn_{gpu_batch_idx:05d}"
-            finals, elapsed = _run_gpu_subprocess(
+            finals, elapsed, _gpu_meta = _run_gpu_subprocess(
                 cuda_bin=cuda_bin,
                 input_csv=trimmed_csv,
                 n_gpu=take,
