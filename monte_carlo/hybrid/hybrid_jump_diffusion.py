@@ -24,6 +24,7 @@ import os
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
@@ -106,17 +107,18 @@ def _run_gpu_subprocess(
     jump_threshold_mult: float,
     dt: float,
     tmpdir: Path,
+    artifact_prefix: str = "hybrid_gpu",
 ) -> Tuple[np.ndarray, float, Dict[str, Any]]:
     if n_gpu <= 0:
-        return np.zeros(0, dtype=np.float64), 0.0
+        return np.zeros(0, dtype=np.float64), 0.0, {}
     if not cuda_bin.is_file():
         raise FileNotFoundError(
             f"CUDA binary not found at {cuda_bin}. Build with: make -C monte_carlo/GPU"
         )
 
-    bars_out = tmpdir / "hybrid_gpu_bars.csv"
-    params_out = tmpdir / "hybrid_gpu_params.json"
-    finals_out = tmpdir / "hybrid_gpu_final_prices.csv"
+    bars_out = tmpdir / f"{artifact_prefix}_bars.csv"
+    params_out = tmpdir / f"{artifact_prefix}_params.json"
+    finals_out = tmpdir / f"{artifact_prefix}_final_prices.csv"
 
     cmd = [
         str(cuda_bin),
@@ -175,9 +177,125 @@ def _run_gpu_subprocess(
     return finals, t1 - t0, gpu_meta
 
 
+def _run_dynamic_hybrid(
+    *,
+    cuda_bin: Path,
+    trimmed_csv: Path,
+    tmpdir: Path,
+    n_paths: int,
+    n_steps: int,
+    params,
+    dt: float,
+    jump_threshold_mult: float,
+    base_seed_cpu: int,
+    base_seed_gpu: int,
+    batch_cap: int,
+    cpu_chunk_size: int,
+) -> tuple[list[np.ndarray], np.ndarray, float, float, float, int, int]:
+    """
+    Dynamic batch queue: CPU and GPU workers share a path budget (thread-safe claims).
+    GPU uses the stock jump_diffusion_cuda binary once per claimed batch.
+    """
+    if not cuda_bin.is_file():
+        raise FileNotFoundError(
+            f"CUDA binary not found at {cuda_bin}. Build with: make -C monte_carlo/GPU"
+        )
+
+    remaining = n_paths
+    lock = threading.Lock()
+    cpu_parts: list[np.ndarray] = []
+    gpu_batches: list[np.ndarray] = []
+    cpu_batch_time = 0.0
+    gpu_batch_time = 0.0
+    cpu_paths_done = 0
+    gpu_paths_done = 0
+    cpu_batch_idx = 0
+    gpu_batch_idx = 0
+
+    def claim() -> int:
+        nonlocal remaining
+        with lock:
+            if remaining <= 0:
+                return 0
+            take = min(batch_cap, remaining)
+            remaining -= take
+            return take
+
+    def cpu_worker() -> None:
+        nonlocal cpu_batch_time, cpu_paths_done, cpu_batch_idx
+        while True:
+            take = claim()
+            if take == 0:
+                break
+            seed_b = int(base_seed_cpu) + cpu_batch_idx * 1_000_003
+            t0 = time.perf_counter()
+            paths = simulate_jump_diffusion_paths(
+                n_paths=take,
+                n_steps=n_steps,
+                params=params,
+                dt=dt,
+                seed=seed_b,
+                chunk_size=min(cpu_chunk_size, take),
+            )
+            t1 = time.perf_counter()
+            cpu_batch_time += t1 - t0
+            cpu_parts.append(paths[:, -1].copy())
+            cpu_paths_done += take
+            cpu_batch_idx += 1
+
+    def gpu_worker() -> None:
+        nonlocal gpu_batch_time, gpu_paths_done, gpu_batch_idx
+        while True:
+            take = claim()
+            if take == 0:
+                break
+            seed_b = int(base_seed_gpu) + gpu_batch_idx * 1_000_003
+            prefix = f"gpu_dyn_{gpu_batch_idx:05d}"
+            finals, elapsed = _run_gpu_subprocess(
+                cuda_bin=cuda_bin,
+                input_csv=trimmed_csv,
+                n_gpu=take,
+                n_steps=n_steps,
+                seed=seed_b,
+                jump_threshold_mult=jump_threshold_mult,
+                dt=dt,
+                tmpdir=tmpdir,
+                artifact_prefix=prefix,
+            )
+            gpu_batch_time += elapsed
+            gpu_batches.append(finals)
+            gpu_paths_done += take
+            gpu_batch_idx += 1
+
+    wall0 = time.perf_counter()
+    t_cpu = threading.Thread(target=cpu_worker, name="cpu_batches")
+    t_gpu = threading.Thread(target=gpu_worker, name="gpu_batches")
+    t_cpu.start()
+    t_gpu.start()
+    t_cpu.join()
+    t_gpu.join()
+    wall1 = time.perf_counter()
+
+    if cpu_paths_done + gpu_paths_done != n_paths:
+        raise RuntimeError(
+            f"Path accounting error: cpu={cpu_paths_done} gpu={gpu_paths_done} total={n_paths}"
+        )
+
+    gpu_finals = np.concatenate(gpu_batches) if gpu_batches else np.zeros(0, dtype=np.float64)
+    return (
+        cpu_parts,
+        gpu_finals,
+        wall1 - wall0,
+        cpu_batch_time,
+        gpu_batch_time,
+        cpu_paths_done,
+        gpu_paths_done,
+    )
+
+
 def main() -> None:
     ap = argparse.ArgumentParser(
-        description="Hybrid CPU+GPU jump-diffusion benchmark (parallel split + merged finals)."
+        description="Hybrid CPU+GPU jump-diffusion benchmark (static split or dynamic batch queue)."
     )
     ap.add_argument("--input", required=True, help="OHLC CSV (timestamp, open, high, low, close).")
     ap.add_argument("--n-paths", type=int, default=10_000, help="Total Monte Carlo paths.")
@@ -190,12 +308,19 @@ def main() -> None:
     ap.add_argument(
         "--max-steps",
         type=int,
-        default=500_000,
-        help="When --n-steps 0, cap steps at this (avoid loading entire year on laptop).",
+        default=0,
+        help="When --n-steps is 0, cap steps at this. 0 means use all rows.",
     )
-    ap.add_argument("--cpu-fraction", type=float, default=0.35, help="Fraction of paths on CPU if counts not set.")
-    ap.add_argument("--n-cpu", type=int, default=None, help="Exact CPU path count (optional).")
-    ap.add_argument("--n-gpu", type=int, default=None, help="Exact GPU path count (optional).")
+    ap.add_argument(
+        "--schedule",
+        choices=("static", "dynamic"),
+        default="static",
+        help="static = fixed CPU/GPU counts; dynamic = shared batch queue (multiple GPU runs).",
+    )
+    ap.add_argument("--batch-cap", type=int, default=4096, help="Max paths claimed per batch (dynamic schedule).")
+    ap.add_argument("--cpu-fraction", type=float, default=0.35, help="(static) CPU path fraction.")
+    ap.add_argument("--n-cpu", type=int, default=None, help="(static) Exact CPU path count.")
+    ap.add_argument("--n-gpu", type=int, default=None, help="(static) Exact GPU path count.")
     ap.add_argument("--seed", type=int, default=42, help="CPU seed; GPU uses seed + offset.")
     ap.add_argument("--gpu-seed-offset", type=int, default=1_000_003, help="Added to --seed for GPU RNG.")
     ap.add_argument("--chunk-size", type=int, default=256, help="CPU batch size (paths per chunk).")
@@ -225,7 +350,7 @@ def main() -> None:
     if args.n_steps and args.n_steps > 0:
         n_steps = min(n_available, args.n_steps)
     else:
-        n_steps = min(n_available, args.max_steps)
+        n_steps = n_available if int(args.max_steps) <= 0 else min(n_available, int(args.max_steps))
     if n_steps < 3:
         raise SystemExit("Need at least 3 steps after applying n_steps/max_steps.")
 
@@ -238,12 +363,8 @@ def main() -> None:
     if n_paths < 1:
         raise SystemExit("--n-paths must be >= 1")
 
-    n_cpu, n_gpu = _split_counts(n_paths, args.n_cpu, args.n_gpu, args.cpu_fraction)
-    if n_cpu + n_gpu != n_paths:
-        raise SystemExit("Internal split error: n_cpu + n_gpu != n_paths")
-
     cuda_bin = Path(args.cuda_bin) if args.cuda_bin else _default_cuda_binary()
-    gpu_seed = int(args.seed) + int(args.gpu_seed_offset)
+    gpu_base_seed = int(args.seed) + int(args.gpu_seed_offset)
 
     reports_dir = REPO_ROOT / "reports" / "jump_diffusion"
     reports_dir.mkdir(parents=True, exist_ok=True)
@@ -256,49 +377,80 @@ def main() -> None:
         df.to_csv(trimmed_csv, index=False)
         t_save1 = time.perf_counter()
 
-        wall0 = time.perf_counter()
-        cpu_paths = None  # type: Optional[np.ndarray]
-        gpu_finals = None  # type: Optional[np.ndarray]
-        cpu_sim_s: float = 0.0
-        gpu_wall_s: float = 0.0
-        gpu_meta = {}  # type: Dict[str, Any]
-
-        with ThreadPoolExecutor(max_workers=2) as ex:
-            f_cpu = ex.submit(
-                _run_cpu_paths,
-                n_cpu=n_cpu,
+        if args.schedule == "dynamic":
+            if int(args.batch_cap) < 1:
+                raise SystemExit("--batch-cap must be >= 1")
+            cpu_parts, gpu_finals, hybrid_wall_s, cpu_sim_s, gpu_wall_s, n_cpu, n_gpu = _run_dynamic_hybrid(
+                cuda_bin=cuda_bin,
+                trimmed_csv=trimmed_csv,
+                tmpdir=tmpdir,
+                n_paths=n_paths,
                 n_steps=n_steps,
                 params=params,
                 dt=float(args.dt),
-                seed=int(args.seed),
-                chunk_size=int(args.chunk_size),
-            )
-            f_gpu = ex.submit(
-                _run_gpu_subprocess,
-                cuda_bin=cuda_bin,
-                input_csv=trimmed_csv,
-                n_gpu=n_gpu,
-                n_steps=n_steps,
-                seed=gpu_seed,
                 jump_threshold_mult=float(args.jump_threshold_mult),
-                dt=float(args.dt),
-                tmpdir=tmpdir,
+                base_seed_cpu=int(args.seed),
+                base_seed_gpu=gpu_base_seed,
+                batch_cap=int(args.batch_cap),
+                cpu_chunk_size=int(args.chunk_size),
             )
+            cpu_finals = np.concatenate(cpu_parts) if cpu_parts else np.zeros(0, dtype=np.float64)
+            merged = np.concatenate([cpu_finals, gpu_finals]) if (cpu_finals.size or gpu_finals.size) else np.zeros(0)
+            ideal_parallel = max(cpu_sim_s, gpu_wall_s)
+            serial_sum = cpu_sim_s + gpu_wall_s
+            gpu_meta: Dict[str, Any] = {}
+        else:
+            n_cpu, n_gpu = _split_counts(n_paths, args.n_cpu, args.n_gpu, args.cpu_fraction)
+            if n_cpu + n_gpu != n_paths:
+                raise SystemExit("Internal split error: n_cpu + n_gpu != n_paths")
 
-            for fut in as_completed([f_cpu, f_gpu]):
-                if fut is f_cpu:
-                    cpu_paths, cpu_sim_s = fut.result()
-                else:
-                    gpu_finals, gpu_wall_s, gpu_meta = fut.result()
+            wall0 = time.perf_counter()
+            cpu_paths: Optional[np.ndarray] = None
+            gpu_finals_arr: Optional[np.ndarray] = None
+            cpu_sim_s = 0.0
+            gpu_wall_s = 0.0
+            gpu_meta = {}
 
-        wall1 = time.perf_counter()
-        hybrid_wall_s = wall1 - wall0
+            with ThreadPoolExecutor(max_workers=2) as ex:
+                f_cpu = ex.submit(
+                    _run_cpu_paths,
+                    n_cpu=n_cpu,
+                    n_steps=n_steps,
+                    params=params,
+                    dt=float(args.dt),
+                    seed=int(args.seed),
+                    chunk_size=int(args.chunk_size),
+                )
+                f_gpu = ex.submit(
+                    _run_gpu_subprocess,
+                    cuda_bin=cuda_bin,
+                    input_csv=trimmed_csv,
+                    n_gpu=n_gpu,
+                    n_steps=n_steps,
+                    seed=gpu_base_seed,
+                    jump_threshold_mult=float(args.jump_threshold_mult),
+                    dt=float(args.dt),
+                    tmpdir=tmpdir,
+                    artifact_prefix="hybrid_gpu",
+                )
 
-        if cpu_paths is None or gpu_finals is None:
-            raise RuntimeError("CPU or GPU task did not complete.")
+                for fut in as_completed([f_cpu, f_gpu]):
+                    if fut is f_cpu:
+                        cpu_paths, cpu_sim_s = fut.result()
+                    else:
+                        gpu_finals_arr, gpu_wall_s, gpu_meta = fut.result()
 
-        cpu_finals = cpu_paths[:, -1] if cpu_paths.shape[0] else np.zeros(0, dtype=np.float64)
-        merged = np.concatenate([cpu_finals, gpu_finals]) if (cpu_finals.size or gpu_finals.size) else np.zeros(0)
+            wall1 = time.perf_counter()
+            hybrid_wall_s = wall1 - wall0
+
+            if cpu_paths is None or gpu_finals_arr is None:
+                raise RuntimeError("CPU or GPU task did not complete.")
+
+            cpu_finals = cpu_paths[:, -1] if cpu_paths.shape[0] else np.zeros(0, dtype=np.float64)
+            gpu_finals = gpu_finals_arr
+            merged = np.concatenate([cpu_finals, gpu_finals]) if (cpu_finals.size or gpu_finals.size) else np.zeros(0)
+            ideal_parallel = max(cpu_sim_s, gpu_wall_s)
+            serial_sum = cpu_sim_s + gpu_wall_s
 
         mean_f = float(np.mean(merged)) if merged.size else 0.0
         std_f = float(np.std(merged, ddof=1)) if merged.size > 1 else 0.0
@@ -331,10 +483,13 @@ def main() -> None:
         comm_comp_ratio = ((runtime_s - sim_s) / sim_s) if sim_s > 0 else 0.0
         speedup = (float(args.cpu_runtime_seconds) / runtime_s) if args.cpu_runtime_seconds and runtime_s > 0 else None
 
+        print(f"{'Schedule':>14} | {args.schedule}")
         print(f"{'Paths (total)':>14} | {n_paths}")
         print(f"{'n_steps':>14} | {n_steps}")
         print(f"{'CPU paths':>14} | {n_cpu}")
         print(f"{'GPU paths':>14} | {n_gpu}")
+        if args.schedule == "dynamic":
+            print(f"{'batch_cap':>14} | {args.batch_cap}")
         print(f"{'CPU sim (s)':>14} | {cpu_sim_s:.6f}")
         print(f"{'GPU wall (s)':>14} | {gpu_wall_s:.6f}")
         print(f"{'Hybrid wall (s)':>14} | {hybrid_wall_s:.6f}  (concurrent section only)")
@@ -355,6 +510,7 @@ def main() -> None:
         if args.json_out:
             out = {
                 "mode": "hybrid_jump_diffusion",
+                "schedule": args.schedule,
                 "input": str(input_csv),
                 "trimmed_rows": n_steps,
                 "n_paths": n_paths,
@@ -385,9 +541,11 @@ def main() -> None:
                 "merged_final_mean": mean_f,
                 "merged_final_std": std_f,
                 "seed_cpu": int(args.seed),
-                "seed_gpu": gpu_seed,
+                "seed_gpu": gpu_base_seed,
                 "cuda_binary": str(cuda_bin),
             }
+            if args.schedule == "dynamic":
+                out["batch_cap"] = int(args.batch_cap)
             Path(args.json_out).write_text(json.dumps(out, indent=2, sort_keys=True) + "\n", encoding="utf-8")
             print(f"\nWrote {args.json_out}")
 
