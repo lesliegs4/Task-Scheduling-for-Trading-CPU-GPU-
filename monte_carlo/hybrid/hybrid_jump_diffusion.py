@@ -10,15 +10,13 @@ many paths each device owns. It is not an OS scheduler.
 Usage (from repo root, after building the CUDA binary):
 
   make -C monte_carlo/GPU
-  python benchmarks/hybrid_jump_diffusion.py --input usdjpy-m1-bid-2013.csv --n-paths 10000
+  python monte_carlo/hybrid/hybrid_jump_diffusion.py --input usdjpy-m1-bid-2013.csv --n-paths 10000
 
 Override binary path if needed:
 
   set JUMP_DIFFUSION_CUDA_BIN=C:\\path\\to\\jump_diffusion_cuda.exe   # Windows
   export JUMP_DIFFUSION_CUDA_BIN=/path/to/jump_diffusion_cuda         # Linux
 """
-
-from __future__ import annotations
 
 import argparse
 import json
@@ -31,8 +29,10 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 
 import numpy as np
+from typing import Any, Dict, Optional, Tuple
 
-REPO_ROOT = Path(__file__).resolve().parents[1]
+# Repo root: .../Task-Scheduling-for-Trading-CPU-GPU-
+REPO_ROOT = Path(__file__).resolve().parents[2]
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
@@ -55,7 +55,7 @@ def _default_cuda_binary() -> Path:
     return base
 
 
-def _split_counts(n_paths: int, n_cpu: int | None, n_gpu: int | None, cpu_fraction: float) -> tuple[int, int]:
+def _split_counts(n_paths: int, n_cpu: Optional[int], n_gpu: Optional[int], cpu_fraction: float) -> Tuple[int, int]:
     if n_cpu is not None and n_gpu is not None:
         if n_cpu + n_gpu != n_paths:
             raise ValueError(f"n_cpu ({n_cpu}) + n_gpu ({n_gpu}) must equal n_paths ({n_paths}).")
@@ -80,7 +80,7 @@ def _run_cpu_paths(
     dt: float,
     seed: int,
     chunk_size: int,
-) -> tuple[np.ndarray, float]:
+) -> Tuple[np.ndarray, float]:
     if n_cpu <= 0:
         return np.zeros((0, n_steps), dtype=np.float64), 0.0
     t0 = time.perf_counter()
@@ -106,7 +106,7 @@ def _run_gpu_subprocess(
     jump_threshold_mult: float,
     dt: float,
     tmpdir: Path,
-) -> tuple[np.ndarray, float]:
+) -> Tuple[np.ndarray, float, Dict[str, Any]]:
     if n_gpu <= 0:
         return np.zeros(0, dtype=np.float64), 0.0
     if not cuda_bin.is_file():
@@ -166,7 +166,13 @@ def _run_gpu_subprocess(
         raise RuntimeError(
             f"Expected {n_gpu} GPU final prices, got {finals.shape[0]} from {finals_out}"
         )
-    return finals, t1 - t0
+    gpu_meta: Dict[str, Any] = {}
+    if params_out.is_file():
+        try:
+            gpu_meta = json.loads(params_out.read_text(encoding="utf-8"))
+        except Exception:
+            gpu_meta = {}
+    return finals, t1 - t0, gpu_meta
 
 
 def main() -> None:
@@ -197,13 +203,24 @@ def main() -> None:
     ap.add_argument("--dt", type=float, default=1.0, help="Time step per bar (matches synth scripts).")
     ap.add_argument("--cuda-bin", default="", help="Path to jump_diffusion_cuda; default build path or env.")
     ap.add_argument("--json-out", default="", help="Optional path to write timing + split metadata JSON.")
+    ap.add_argument(
+        "--cpu-runtime-seconds",
+        type=float,
+        default=0.0,
+        help="Optional: baseline CPU runtime (seconds) to compute speedup for the hybrid table row.",
+    )
     args = ap.parse_args()
 
     input_csv = Path(args.input)
     if not input_csv.is_file():
         raise SystemExit(f"Input not found: {input_csv}")
 
+    # Measure end-to-end time including load+fit so it's comparable to CPU/GPU scripts.
+    t_total0 = time.perf_counter()
+
+    t_load0 = time.perf_counter()
     df_full = load_bars(input_csv)
+    t_load1 = time.perf_counter()
     n_available = len(df_full)
     if args.n_steps and args.n_steps > 0:
         n_steps = min(n_available, args.n_steps)
@@ -213,7 +230,9 @@ def main() -> None:
         raise SystemExit("Need at least 3 steps after applying n_steps/max_steps.")
 
     df = df_full.iloc[:n_steps].copy()
+    t_fit0 = time.perf_counter()
     params = fit_jump_diffusion_params(df, jump_threshold_mult=args.jump_threshold_mult)
+    t_fit1 = time.perf_counter()
 
     n_paths = int(args.n_paths)
     if n_paths < 1:
@@ -233,13 +252,16 @@ def main() -> None:
         tmpdir = Path(tmpdir_s)
         # Persist a truncated CSV so the CUDA fit sees the same rows as Python (first n_steps bars).
         trimmed_csv = tmpdir / "hybrid_input_trimmed.csv"
+        t_save0 = time.perf_counter()
         df.to_csv(trimmed_csv, index=False)
+        t_save1 = time.perf_counter()
 
         wall0 = time.perf_counter()
-        cpu_paths: np.ndarray | None = None
-        gpu_finals: np.ndarray | None = None
+        cpu_paths = None  # type: Optional[np.ndarray]
+        gpu_finals = None  # type: Optional[np.ndarray]
         cpu_sim_s: float = 0.0
         gpu_wall_s: float = 0.0
+        gpu_meta = {}  # type: Dict[str, Any]
 
         with ThreadPoolExecutor(max_workers=2) as ex:
             f_cpu = ex.submit(
@@ -267,7 +289,7 @@ def main() -> None:
                 if fut is f_cpu:
                     cpu_paths, cpu_sim_s = fut.result()
                 else:
-                    gpu_finals, gpu_wall_s = fut.result()
+                    gpu_finals, gpu_wall_s, gpu_meta = fut.result()
 
         wall1 = time.perf_counter()
         hybrid_wall_s = wall1 - wall0
@@ -284,18 +306,51 @@ def main() -> None:
         ideal_parallel = max(cpu_sim_s, gpu_wall_s)
         serial_sum = cpu_sim_s + gpu_wall_s
 
+        t_total1 = time.perf_counter()
+        total_elapsed_s = t_total1 - t_total0
+
+        load_sv_seconds = t_load1 - t_load0
+        fit_parameters_seconds = t_fit1 - t_fit0
+        save_files_seconds = t_save1 - t_save0
+        # Hybrid "simulation time" for the table: critical-path time while CPU+GPU compute overlap.
+        # If you want pure wall during the concurrent section, that's `hybrid_wall_s`.
+        gpu_sim_s = 0.0
+        try:
+            tb = (gpu_meta.get("timing_breakdown") or {}) if isinstance(gpu_meta, dict) else {}
+            gpu_sim_s = float(tb.get("jump_diffusion_simulation_seconds") or 0.0)
+        except Exception:
+            gpu_sim_s = 0.0
+        jump_diffusion_simulation_seconds = max(cpu_sim_s, gpu_sim_s if gpu_sim_s > 0 else gpu_wall_s)
+        generate_plots_seconds = 0.0
+
+        # Table metrics
+        runtime_s = total_elapsed_s
+        sim_s = jump_diffusion_simulation_seconds
+        throughput = (n_paths / runtime_s) if runtime_s > 0 else 0.0
+        compute_pct = (sim_s / runtime_s * 100.0) if runtime_s > 0 else 0.0
+        comm_comp_ratio = ((runtime_s - sim_s) / sim_s) if sim_s > 0 else 0.0
+        speedup = (float(args.cpu_runtime_seconds) / runtime_s) if args.cpu_runtime_seconds and runtime_s > 0 else None
+
         print(f"{'Paths (total)':>14} | {n_paths}")
         print(f"{'n_steps':>14} | {n_steps}")
         print(f"{'CPU paths':>14} | {n_cpu}")
         print(f"{'GPU paths':>14} | {n_gpu}")
         print(f"{'CPU sim (s)':>14} | {cpu_sim_s:.6f}")
         print(f"{'GPU wall (s)':>14} | {gpu_wall_s:.6f}")
-        print(f"{'Hybrid wall (s)':>14} | {hybrid_wall_s:.6f}")
+        print(f"{'Hybrid wall (s)':>14} | {hybrid_wall_s:.6f}  (concurrent section only)")
+        print(f"{'Total elapsed':>14} | {total_elapsed_s:.6f}  (load+fit+concurrent+overhead)")
         print(f"{'max(CPU,GPU)':>14} | {ideal_parallel:.6f}  (ideal overlap lower bound)")
         print(f"{'CPU+GPU sum':>14} | {serial_sum:.6f}  (if run back-to-back)")
-        print(f"{'Throughput':>14} | {n_paths / hybrid_wall_s:.1f} paths/s")
+        print(f"{'Throughput':>14} | {throughput:.1f} paths/s  (uses total elapsed)")
         print(f"{'Merged mean':>14} | {mean_f:.6g}")
         print(f"{'Merged std':>14} | {std_f:.6g}")
+        print("\n--- Table metrics (hybrid) ---")
+        print(f"{'Runtime (s)':>14} | {runtime_s:.6f}")
+        print(f"{'Sim time (s)':>14} | {sim_s:.6f}")
+        if speedup is not None:
+            print(f"{'Speedup':>14} | {speedup:.3f}x  (vs --cpu-runtime-seconds)")
+        print(f"{'Compute %':>14} | {compute_pct:.2f}%")
+        print(f"{'Comm/Comp':>14} | {comm_comp_ratio:.6f}")
 
         if args.json_out:
             out = {
@@ -305,12 +360,28 @@ def main() -> None:
                 "n_paths": n_paths,
                 "n_cpu": n_cpu,
                 "n_gpu": n_gpu,
+                "elapsed_seconds": total_elapsed_s,
+                "timing_breakdown": {
+                    "fit_parameters_seconds": fit_parameters_seconds,
+                    "generate_plots_seconds": generate_plots_seconds,
+                    "jump_diffusion_simulation_seconds": jump_diffusion_simulation_seconds,
+                    "load_sv_seconds": load_sv_seconds,
+                    "save_files_seconds": save_files_seconds,
+                },
+                "hybrid_concurrent_wall_seconds": hybrid_wall_s,
                 "cpu_sim_seconds": cpu_sim_s,
                 "gpu_wall_seconds": gpu_wall_s,
-                "hybrid_wall_seconds": hybrid_wall_s,
+                "gpu_reported_sim_seconds": gpu_sim_s,
                 "ideal_parallel_lower_bound_seconds": ideal_parallel,
                 "serial_sum_seconds": serial_sum,
-                "throughput_paths_per_sec": n_paths / hybrid_wall_s if hybrid_wall_s > 0 else None,
+                "table_metrics": {
+                    "runtime_seconds": runtime_s,
+                    "sim_time_seconds": sim_s,
+                    "throughput_paths_per_sec": throughput,
+                    "compute_percent": compute_pct,
+                    "comm_comp_ratio": comm_comp_ratio,
+                    "speedup_vs_cpu": speedup,
+                },
                 "merged_final_mean": mean_f,
                 "merged_final_std": std_f,
                 "seed_cpu": int(args.seed),

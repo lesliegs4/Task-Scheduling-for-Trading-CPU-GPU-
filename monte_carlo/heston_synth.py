@@ -18,9 +18,6 @@ from dataclasses import asdict
 from pathlib import Path
 from time import perf_counter
 
-import matplotlib
-matplotlib.use("Agg")
-import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
 
@@ -168,6 +165,17 @@ def plot_heston_results(
     output_prefix: str,
     max_paths_to_plot: int = 20,
 ) -> list[str]:
+    try:
+        import matplotlib
+
+        matplotlib.use("Agg")
+        import matplotlib.pyplot as plt
+    except ModuleNotFoundError as e:
+        raise ModuleNotFoundError(
+            "matplotlib is required for plotting. "
+            "Install it or pass --no-plots to skip plot generation."
+        ) from e
+
     output_files: list[str] = []
     prefix = Path(output_prefix)
 
