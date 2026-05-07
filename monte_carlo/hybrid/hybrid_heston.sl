@@ -70,6 +70,17 @@ echo "HYBRID_PY=${HYBRID_PY}"
 echo "nvcc: $(command -v nvcc || echo 'missing')"
 nvcc --version 2>/dev/null || true
 
+# Rebuild when heston_gpu.cu is newer than heston_gpu (otherwise an old binary is reused forever).
+if [[ -f "${HYBRID_ROOT}/heston_gpu.cu" ]]; then
+  if [[ ! -f "${HYBRID_ROOT}/heston_gpu" ]] || [[ "${HYBRID_ROOT}/heston_gpu.cu" -nt "${HYBRID_ROOT}/heston_gpu" ]]; then
+    NVCC_CMD="${NVCC:-nvcc}"
+    HESTON_NVCC_ARCH="${HESTON_NVCC_ARCH:-sm_70}"
+    echo "[BUILD] ${NVCC_CMD} heston_gpu.cu -> ${HYBRID_ROOT}/heston_gpu (arch=${HESTON_NVCC_ARCH})"
+    "${NVCC_CMD}" -O3 -arch="${HESTON_NVCC_ARCH}" -o "${HYBRID_ROOT}/heston_gpu" \
+      "${HYBRID_ROOT}/heston_gpu.cu" -lcurand -std=c++17
+  fi
+fi
+
 # Use existing heston_gpu if present; otherwise build from a known Makefile location.
 if [[ -n "${HESTON_CUDA_BIN:-}" && -f "${HESTON_CUDA_BIN}" ]]; then
   :
@@ -107,7 +118,8 @@ fi
 
 INPUT_CSV="${INPUT_CSV:-usdjpy-m1-bid-2013.csv}"
 N_PATHS="${N_PATHS:-100000}"
-N_STEPS="${N_STEPS:-200}"
+# Default to full CSV length. Use HYBRID_N_STEPS or positional arg #2 to override.
+N_STEPS="${HYBRID_N_STEPS:-0}"
 SCHEDULE="${SCHEDULE:-static}"
 CPU_FRACTION="${CPU_FRACTION:-0.35}"
 BATCH_CAP="${BATCH_CAP:-4096}"

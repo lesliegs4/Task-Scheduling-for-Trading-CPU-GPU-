@@ -100,6 +100,21 @@ def _default_cuda_binary() -> Path:
     return candidates[0]
 
 
+def _gpu_binary_supports_final_prices_csv(cuda_bin: Path) -> bool:
+    """True if this heston_gpu was built with --output-final-prices (required by the hybrid driver)."""
+    if not cuda_bin.is_file():
+        return True
+    proc = subprocess.run(
+        [str(cuda_bin)],
+        capture_output=True,
+        text=True,
+        timeout=60,
+        check=False,
+    )
+    combined = (proc.stdout or "") + (proc.stderr or "")
+    return "output-final-prices" in combined
+
+
 def _split_counts(
     n_paths: int, n_cpu: Optional[int], n_gpu: Optional[int], cpu_fraction: float
 ) -> Tuple[int, int]:
@@ -163,7 +178,11 @@ def _run_gpu_subprocess(
 
     bars_out = tmpdir / f"{artifact_prefix}_bars.csv"
     params_out = tmpdir / f"{artifact_prefix}_params.json"
-    finals_out = tmpdir / f"{artifact_prefix}_final_prices.csv"
+    # Write per-GPU-run finals next to the job / cwd (not under tempfile), so outputs stay in
+    # the directory you cd to before sbatch. Names stay unique per batch (dynamic prefixes).
+    _jid = os.environ.get("SLURM_JOB_ID", "").strip()
+    _stem = f"{artifact_prefix}_{_jid}" if _jid else artifact_prefix
+    finals_out = (Path.cwd() / f"{_stem}_final_prices.csv").resolve()
 
     cmd = [
         str(cuda_bin),
@@ -176,9 +195,9 @@ def _run_gpu_subprocess(
         "--block-size",
         str(block_size),
         "--out-bars",
-        str(bars_out),
+        str(bars_out.resolve()),
         "--out-params",
-        str(params_out),
+        str(params_out.resolve()),
         "--output-final-prices",
         str(finals_out),
         "--no-bars",
@@ -201,7 +220,13 @@ def _run_gpu_subprocess(
             f"{err}"
         )
     if not finals_out.is_file():
-        raise RuntimeError(f"GPU run did not write final prices: {finals_out}")
+        tail = (proc.stderr or proc.stdout or "").strip()
+        more = f"\n--- heston_gpu output ---\n{tail}\n" if tail else ""
+        raise RuntimeError(
+            f"GPU run did not write final prices: {finals_out}.{more}\n"
+            f"Most often: {cuda_bin} is an old build without --output-final-prices. "
+            f"Rebuild from the project heston_gpu.cu (see hybrid_heston.sl / nvcc line) and replace the binary."
+        )
 
     finals = np.loadtxt(finals_out, dtype=np.float64, skiprows=1)
     if finals.ndim == 0:
@@ -344,8 +369,8 @@ def main() -> None:
     ap.add_argument(
         "--max-steps",
         type=int,
-        default=500_000,
-        help="When --n-steps 0, cap steps at this.",
+        default=0,
+        help="When --n-steps is 0, cap steps at this. 0 means use all rows.",
     )
     ap.add_argument(
         "--schedule",
@@ -387,7 +412,7 @@ def main() -> None:
     if args.n_steps and args.n_steps > 0:
         n_steps = min(n_available, args.n_steps)
     else:
-        n_steps = min(n_available, args.max_steps)
+        n_steps = n_available if int(args.max_steps) <= 0 else min(n_available, int(args.max_steps))
     if n_steps < 3:
         raise SystemExit("Need at least 3 steps after applying n_steps/max_steps.")
 
@@ -400,6 +425,14 @@ def main() -> None:
 
     cuda_bin = Path(args.cuda_bin) if args.cuda_bin else _default_cuda_binary()
     gpu_base_seed = int(args.seed) + int(args.gpu_seed_offset)
+
+    if not _gpu_binary_supports_final_prices_csv(cuda_bin):
+        raise SystemExit(
+            f"GPU binary does not advertise --output-final-prices (required for hybrid):\n  {cuda_bin}\n"
+            f"Rebuild heston_gpu from the repo's heston_gpu.cu on the GPU node, e.g.\n"
+            f"  nvcc -O3 -arch=sm_70 -o heston_gpu heston_gpu.cu -lcurand -std=c++17\n"
+            f"Then place the binary in {HYBRID_ROOT} or set HESTON_CUDA_BIN."
+        )
 
     # Scratch for trimmed CSV + per-batch GPU artifacts; removed when the run finishes.
     with tempfile.TemporaryDirectory(prefix="hybrid_heston_") as tmpdir_s:
