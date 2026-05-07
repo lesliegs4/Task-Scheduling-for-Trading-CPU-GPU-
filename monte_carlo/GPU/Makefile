@@ -28,4 +28,3 @@ $(TARGET): $(SRC) | $(BUILD_DIR)
 
 clean:
 	rm -rf $(BUILD_DIR)
-
